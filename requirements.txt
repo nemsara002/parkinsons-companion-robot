@@ -1,0 +1,15 @@
+# Core vision / ML
+mediapipe==0.10.18
+opencv-python
+scikit-learn
+numpy
+pandas
+
+# Evaluation plots
+matplotlib
+
+# Report PDF generation
+reportlab
+
+# NOTE: picamera2 is NOT listed here — it ships with Raspberry Pi OS and is
+# only available/needed on the Pi, not on the laptop.

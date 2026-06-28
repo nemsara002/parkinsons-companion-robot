@@ -11,3 +11,4 @@ URFD/
 .DS_Store
 .vscode/
 .idea/
+yolov8n.pt
