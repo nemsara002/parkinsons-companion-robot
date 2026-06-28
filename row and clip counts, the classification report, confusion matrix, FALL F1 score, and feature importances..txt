@@ -1,0 +1,42 @@
+appData/Local/Programs/Python/Python311/python.exe c:/Users/kavis/OneDrive/Desktop/IDP/train_fall_model.py
+Loaded 8216 rows, 70 clips
+label
+ADL     6022
+FALL    2194
+Name: count, dtype: int64
+
+Train: 6517 rows from 56 clips
+Test:  1699 rows from 14 clips
+
+=== Classification Report ===
+              precision    recall  f1-score   support
+
+         ADL      0.827     0.941     0.880      1172
+        FALL      0.811     0.562     0.664       527
+
+    accuracy                          0.823      1699
+   macro avg      0.819     0.751     0.772      1699
+weighted avg      0.822     0.823     0.813      1699
+
+=== Confusion Matrix ===
+Labels order: ['ADL', 'FALL']
+[[1103   69]
+ [ 231  296]]
+
+FALL-class F1 score: 0.664
+
+=== Feature Importances ===
+  knee_angle                0.243
+  head_hip_dist             0.195
+  torso_angle               0.187
+  shoulder_hip_y_diff       0.174
+  hip_velocity              0.102
+  angular_velocity          0.098
+
+Model saved to fall_detector_rf.pkl
+PS C:\Users\kavis\OneDrive\Desktop\IDP> 
+
+This ran successfully, but the FALL recall is 0.562 — meaning the model is only catching about 56% of actual falls and missing 44% of them (231 out of 527 FALL frames got misclassified as ADL). That's well below your proposal's target of ≥85% accuracy on fall detection, so we need to fix this before moving on. Let's diagnose properly rather than just guessing at fixes.
+What the numbers are actually telling us
+Look at feature importance: knee_angle (0.243) and head_hip_dist (0.195) dominate, while hip_velocity (0.102) and angular_velocity (0.098) — your only motion-based features — are the weakest. That's the core problem.
+A fall is fundamentally a fast, sudden motion. A single static frame of someone lying on the floor looks identical to someone who lay down on purpose, or is doing floor exercises, or is just sitting low. Your features are mostly static-pose features (angle of knee, distance head-to-hip) snapshotted frame by frame, with weak temporal signal. That's almost certainly why recall is capped around 56% — the model can't tell "person is now horizontal" (ambiguous) from "person just rapidly became horizontal" (a fall) when motion features are underweighted and noisy.

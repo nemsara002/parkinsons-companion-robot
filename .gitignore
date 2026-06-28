@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+data/
+datasets/
+URFD/
+*.mp4
+*.avi
+.DS_Store
+.vscode/
+.idea/

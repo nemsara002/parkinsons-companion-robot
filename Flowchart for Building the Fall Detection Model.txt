@@ -1,0 +1,84 @@
+START
+  │
+  ▼
+Collect Fall Detection Dataset
+(Public datasets + optional custom videos)
+  │
+  │ Reason:
+  │ Need examples of falls and normal activities
+  ▼
+Extract Videos
+  │
+  ▼
+Run Pose Estimation on Each Frame
+(MediaPipe Pose)
+  │
+  │ Output:
+  │ Skeleton keypoints
+  │ (head, shoulders, hips, knees, ankles)
+  ▼
+Extract Features
+  │
+  ├─ Torso angle
+  ├─ Shoulder–hip angle
+  ├─ Knee angle
+  ├─ Head–hip distance
+  ├─ Hip velocity
+  ├─ Torso angular velocity
+  └─ Posture change rate
+  │
+  │ Reason:
+  │ Convert skeleton coordinates into meaningful numbers
+  ▼
+Create Feature Dataset
+  │
+  │ Example:
+  │ [torso_angle, knee_angle,
+  │  hip_velocity, ...]
+  │
+  │ Label:
+  │ FALL / WALK / SIT / BEND
+  ▼
+Data Cleaning & Normalization
+  │
+  │ Reason:
+  │ Remove noisy or missing values
+  ▼
+Split Dataset
+  │
+  ├─ Training Set (80%)
+  └─ Testing Set (20%)
+  │
+  ▼
+Train Random Forest Model
+  │
+  │ Reason:
+  │ Learn patterns associated with falls
+  ▼
+Evaluate Model
+  │
+  ├─ Accuracy
+  ├─ Precision
+  ├─ Recall
+  └─ Confusion Matrix
+  │
+  ▼
+Accuracy Acceptable?
+  │
+ ┌┴─────────────┐
+ │              │
+ NO             YES
+ │              │
+ ▼              ▼
+Adjust Features  Save Trained Model
+or Parameters         (.pkl)
+ │              │
+ └──────┬───────┘
+        ▼
+Deploy on Raspberry Pi
+        │
+        ▼
+Real-Time Testing
+        │
+        ▼
+END
