@@ -1,27 +1,16 @@
 """
-Fall Detection - Real-Time Deployment (LAPTOP / WEBCAM VERSION)
+Fall Detection - Real-Time Deployment (LAPTOP / USB WEBCAM VERSION)
 
-This is the laptop/webcam version for verifying the pipeline logic
-(calibration, feature extraction, windowing, transition_speed) before
-deploying to the Raspberry Pi with the Camera Module. See
-live_fall_detection.py (Pi version) for the picamera2-based deployment
-script - the only meaningful difference is HOW frames are captured;
-all detection logic is identical.
+Use this version on the Raspberry Pi with a USB webcam, OR on a laptop.
+It uses cv2.VideoCapture (standard OpenCV webcam interface) instead of
+picamera2, so it works with any UVC-compatible USB camera on any platform.
 
-Runs MediaPipe Pose on a live camera feed, maintains a rolling window of
-the last WINDOW_SIZE frames' raw features (mirroring the exact pipeline
-used in extract_features.py + make_windows.py + train_fall_model.py),
-and runs the trained Random Forest on each new window to detect falls.
+All detection logic (calibration, feature extraction, windowing,
+transition_speed, uprightness_score) is identical to the Pi CSI version.
+The only difference is how frames are captured.
 
-IMPORTANT: WINDOW_SIZE and STEP here MUST match what was used during
-training (currently 15 and 5) or the model will see out-of-distribution
-input shapes/statistics. If you ever change them in make_windows.py,
-update them here too.
-
-On a FALL detection, this prints/logs an event. Hook your voice
-check-in module and ESP32 alert logic into the `on_fall_detected()`
-function below - this script does not implement those, since this
-project's fall-detector and voice/alert subsystems are separate modules.
+IMPORTANT: WINDOW_SIZE and STEP must match what was used during training
+(currently 15 and 5). If you change them in make_windows.py, update here too.
 """
 
 import cv2
@@ -40,38 +29,58 @@ LM = mp_pose.PoseLandmark
 WINDOW_SIZE = 15
 STEP = 5
 MODEL_PATH = "fall_detector_rf.pkl"
-CAMERA_INDEX = 0   # adjust if using a USB camera other than the default
-DEBUG_PRINT = True  # set False once values look sane - prints raw feature values per window
+CAMERA_INDEX = 0   # change to 1 or 2 if wrong camera opens
+DEBUG_PRINT = True
 
-RAW_FEATURES = [
-    "torso_angle", "knee_angle", "head_hip_dist", "head_hip_dist_raw",
-    "shoulder_hip_y_diff", "hip_velocity", "angular_velocity",
-    "bbox_h", "bbox_w", "bbox_area", "bbox_h_raw", "bbox_w_raw", "bbox_area_raw",
-    "aspect_ratio", "bbox_h_velocity", "bbox_area_velocity",
-    "bbox_h_velocity_raw", "bbox_area_velocity_raw",
-    "uprightness_score", "transition_speed",
-]
-CALIBRATION_FRAMES = 10     # how many valid detections to average for the ruler
-CALIBRATION_MAX_SEARCH = 150  # give up if no person found within this many frames
+# ---- DEPLOYMENT THRESHOLD OVERRIDE ----
+# Set this to None to use the threshold saved in fall_detector_rf.pkl (0.25,
+# tuned for URFD camera geometry). If your camera geometry differs from URFD
+# (different height, angle, distance), set this to a value measured from your
+# actual ADL baseline - typically (your_adl_95th_percentile + small_margin).
+# Run with ADL_CALIBRATION_MODE = True first to measure your baseline, then
+# set this value accordingly.
+DEPLOYMENT_THRESHOLD_OVERRIDE = None  # e.g. set to 0.93 after measuring baseline
 
-# Baseline sanity check: the first few windows after calibration are
-# assumed to be normal/idle activity (the person hasn't fallen yet right
-# after starting the script). If the model's P(FALL) on THESE windows is
-# already high, that's a sign the camera setup (angle/height/lens) produces
-# feature statistics the model doesn't recognize as "normal" - i.e. a
-# domain mismatch versus training data - rather than an actual fall.
-# This won't catch every such issue, but flags the common case early
-# instead of silently producing false alarms throughout a session.
+# ---- ADL CALIBRATION MODE ----
+# Set to True to record P(FALL) values during normal activity to a CSV file,
+# so you can measure your actual ADL baseline at this camera geometry.
+# Run for 60+ seconds of normal activity (standing, walking, sitting, bending)
+# WITHOUT simulating any falls, then set to False and analyze adl_baseline.csv
+# to find the right DEPLOYMENT_THRESHOLD_OVERRIDE value.
+ADL_CALIBRATION_MODE = False
+ADL_CALIBRATION_OUTPUT = "adl_baseline.csv"
+
+# ---- HOMOGRAPHY CORRECTION ----
+# Warps frames from your camera's low-angle geometry to approximate
+# URFD's chest-height horizontal camera geometry, so MediaPipe sees
+# the body from a similar perspective to what the model was trained on.
+# Computed from 4 measured pixel-to-world correspondences:
+#   right_foot=(209,476), left_foot=(258,476),
+#   left_shoulder=(285,141), right_shoulder=(193,143)
+# at camera height=28cm, tilt=15deg, subject distance=272cm.
+# Set APPLY_HOMOGRAPHY = False to disable and compare results.
+APPLY_HOMOGRAPHY = True
+HOMOGRAPHY_MATRIX = np.array([
+    [1.31266057,  0.49787326, -343.16555842],
+    [0.05019921,  1.49489735, -186.22274293],
+    [0.00012996,  0.00149162,    1.00000000],
+])
+IMG_WIDTH, IMG_HEIGHT = 640, 480
+
+# Baseline sanity check constants
+CALIBRATION_FRAMES = 10
+CALIBRATION_MAX_SEARCH = 150
 BASELINE_CHECK_WINDOWS = 6
-BASELINE_WARN_THRESHOLD = 0.5  # if median baseline P(FALL) exceeds this, warn
+BASELINE_WARN_THRESHOLD = 0.5
 
+
+# ---- Feature helper functions ----
 
 def angle_between(p1, p2, p3):
     v1 = np.array([p1.x - p2.x, p1.y - p2.y])
     v2 = np.array([p3.x - p2.x, p3.y - p2.y])
     cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
-    cos_angle = np.clip(cos_angle, -1.0, 1.0)
-    return math.degrees(math.acos(cos_angle))
+    return math.degrees(math.acos(np.clip(cos_angle, -1.0, 1.0)))
 
 
 def torso_angle(landmarks):
@@ -83,16 +92,14 @@ def torso_angle(landmarks):
 
 
 def torso_length(landmarks):
-    """Shoulder-to-hip Euclidean distance - the per-person 'ruler' used
-    to normalize scale-dependent features, mirroring extract_features.py.
-    Must match that implementation exactly or normalized features will
-    be on a different scale than what the model was trained on."""
     l_sh = landmarks[LM.LEFT_SHOULDER.value]
     r_sh = landmarks[LM.RIGHT_SHOULDER.value]
     l_hip = landmarks[LM.LEFT_HIP.value]
     r_hip = landmarks[LM.RIGHT_HIP.value]
-    sh_x, sh_y = (l_sh.x + r_sh.x) / 2, (l_sh.y + r_sh.y) / 2
-    hip_x, hip_y = (l_hip.x + r_hip.x) / 2, (l_hip.y + r_hip.y) / 2
+    sh_x = (l_sh.x + r_sh.x) / 2
+    sh_y = (l_sh.y + r_sh.y) / 2
+    hip_x = (l_hip.x + r_hip.x) / 2
+    hip_y = (l_hip.y + r_hip.y) / 2
     return math.sqrt((hip_x - sh_x) ** 2 + (hip_y - sh_y) ** 2)
 
 
@@ -107,10 +114,9 @@ def bbox_features(landmarks):
 
 
 def uprightness_score(t_angle_deg, bbox_area_norm, area_calib_median):
-    """Combined 0-1 'how upright is this person right now' score, mirroring
-    extract_features.py exactly. Built from BOTH torso_angle and bbox_area
-    so it stays informative for depth-axis falls where torso_angle barely
-    changes but the body's projected silhouette still shrinks quickly."""
+    """Combined 0-1 uprightness metric. 1.0=standing, 0.0=lying flat.
+    Combines torso_angle and bbox_area so depth-axis falls (where
+    torso_angle barely changes) are still captured via area shrinkage."""
     angle_component = 1.0 - min(t_angle_deg / 90.0, 1.0)
     area_ratio = bbox_area_norm / (area_calib_median + 1e-6)
     area_component = min(area_ratio, 1.0)
@@ -118,17 +124,8 @@ def uprightness_score(t_angle_deg, bbox_area_norm, area_calib_median):
 
 
 def landmarks_reliable(landmarks, min_visibility=0.5):
-    """MediaPipe attaches a visibility score (0-1) to each landmark,
-    indicating confidence the point is actually visible/in-frame. When a
-    joint (e.g. an ankle) is out of frame or occluded, MediaPipe still
-    returns a coordinate - often an extrapolated guess that can fall
-    outside the normal 0-1 normalized range entirely. Training data
-    (URFD, fixed wall camera) always kept the full body in frame, so
-    this was never an issue there. A live webcam framing that crops
-    feet/ankles will produce exactly this failure mode, so we check
-    visibility on the key joints our features depend on and reject
-    the frame if any are unreliable, rather than feeding the model
-    garbage coordinates it never saw in training."""
+    """Reject frames where key joints are out of frame or poorly visible,
+    to avoid feeding the model extrapolated/garbage landmark coordinates."""
     key_indices = [
         LM.NOSE.value, LM.LEFT_SHOULDER.value, LM.RIGHT_SHOULDER.value,
         LM.LEFT_HIP.value, LM.RIGHT_HIP.value, LM.LEFT_KNEE.value,
@@ -141,15 +138,8 @@ def landmarks_reliable(landmarks, min_visibility=0.5):
     return True
 
 
-def extract_raw_features(landmarks, prev_state, elapsed_seconds, reference_scale,
-                          area_calib_median):
-    """Computes one frame's raw feature dict, mirroring extract_features.py.
-    prev_state is a dict holding the previous frame's hip_y/torso_angle/
-    bbox_h/bbox_area (normalized AND raw) AND uprightness, or None after a
-    tracking gap. reference_scale is this person's calibrated torso_length,
-    used to normalize scale-dependent features exactly as training did.
-    area_calib_median is the calibrated standing bbox_area (normalized),
-    used to scale uprightness_score's area component per-person."""
+def extract_raw_features(landmarks, prev_state, elapsed_seconds,
+                          reference_scale, area_calib_median):
     nose = landmarks[LM.NOSE.value]
     l_sh = landmarks[LM.LEFT_SHOULDER.value]
     r_sh = landmarks[LM.RIGHT_SHOULDER.value]
@@ -165,20 +155,18 @@ def extract_raw_features(landmarks, prev_state, elapsed_seconds, reference_scale
     head_hip_dist_raw = abs(nose.y - hip_center_y)
     bbox_h_raw, bbox_w_raw, bbox_area_raw, aspect_ratio = bbox_features(landmarks)
 
-    head_hip_dist_norm = head_hip_dist_raw / reference_scale
     bbox_h_norm = bbox_h_raw / reference_scale
     bbox_w_norm = bbox_w_raw / reference_scale
     bbox_area_norm = bbox_area_raw / (reference_scale ** 2)
+    head_hip_dist_norm = head_hip_dist_raw / reference_scale
 
     current_uprightness = uprightness_score(t_angle, bbox_area_norm, area_calib_median)
 
-    hip_velocity = 0.0
-    angular_velocity = 0.0
-    bbox_h_velocity = 0.0
-    bbox_area_velocity = 0.0
-    bbox_h_velocity_raw = 0.0
-    bbox_area_velocity_raw = 0.0
+    hip_velocity = angular_velocity = 0.0
+    bbox_h_velocity = bbox_area_velocity = 0.0
+    bbox_h_velocity_raw = bbox_area_velocity_raw = 0.0
     transition_speed = 0.0
+
     if prev_state is not None and elapsed_seconds > 0:
         hip_velocity = abs(hip_center_y - prev_state["hip_y"]) / reference_scale / elapsed_seconds
         angular_velocity = abs(t_angle - prev_state["torso_angle"]) / elapsed_seconds
@@ -186,9 +174,6 @@ def extract_raw_features(landmarks, prev_state, elapsed_seconds, reference_scale
         bbox_area_velocity = abs(bbox_area_norm - prev_state["bbox_area_norm"]) / elapsed_seconds
         bbox_h_velocity_raw = abs(bbox_h_raw - prev_state["bbox_h_raw"]) / elapsed_seconds
         bbox_area_velocity_raw = abs(bbox_area_raw - prev_state["bbox_area_raw"]) / elapsed_seconds
-        # Positive only when COLLAPSING (uprightness decreasing) - matches
-        # extract_features.py exactly, floored at 0 since we only care
-        # about collapse speed, not recovery speed.
         drop = prev_state["uprightness"] - current_uprightness
         transition_speed = max(drop, 0.0) / elapsed_seconds
 
@@ -224,9 +209,14 @@ def extract_raw_features(landmarks, prev_state, elapsed_seconds, reference_scale
 
 
 def window_to_feature_vector(window_frames, feature_cols):
-    """Mirrors make_windows.py: mean/max/std per raw feature, plus
-    torso_angle and head_hip_dist and bbox_area/aspect_ratio net change.
-    window_frames is a list of raw-feature dicts, oldest first."""
+    RAW_FEATURES = [
+        "torso_angle", "knee_angle", "head_hip_dist", "head_hip_dist_raw",
+        "shoulder_hip_y_diff", "hip_velocity", "angular_velocity",
+        "bbox_h", "bbox_w", "bbox_area", "bbox_h_raw", "bbox_w_raw", "bbox_area_raw",
+        "aspect_ratio", "bbox_h_velocity", "bbox_area_velocity",
+        "bbox_h_velocity_raw", "bbox_area_velocity_raw",
+        "uprightness_score", "transition_speed",
+    ]
     row = {}
     for feat in RAW_FEATURES:
         vals = np.array([f[feat] for f in window_frames])
@@ -253,7 +243,6 @@ def window_to_feature_vector(window_frames, feature_cols):
         window_frames[-1]["uprightness_score"] - window_frames[0]["uprightness_score"]
     )
 
-    # Order matters: must match FEATURE_COLS order from training exactly.
     final_vector = [row[c] for c in feature_cols]
 
     if DEBUG_PRINT:
@@ -267,23 +256,21 @@ def window_to_feature_vector(window_frames, feature_cols):
 
 
 def calibrate_reference_scale(cap, pose):
-    """Searches forward through the live feed for the first reliable
-    detections of the person and averages their torso_length AND bbox_area
-    to get the 'ruler' for normalizing scale-dependent features and the
-    standing-baseline area for uprightness_score. Mirrors the calibration
-    pass in extract_features.py's process_video(). Ask the person to stand
-    fully in frame, upright, during this step."""
-    print(f"Calibrating... please stand fully in frame, upright, facing the camera.")
+    print("Calibrating... please stand fully in frame, upright, facing the camera.")
     calib_lengths = []
     calib_areas_raw = []
     frames_scanned = 0
+
     while frames_scanned < CALIBRATION_MAX_SEARCH and len(calib_lengths) < CALIBRATION_FRAMES:
         ret, frame = cap.read()
         if not ret:
             break
-        # cv2.VideoCapture gives BGR - convert to RGB for MediaPipe, unlike
-        # the Pi version where picamera2 already provides RGB directly.
+        # Webcam gives BGR — convert to RGB for MediaPipe
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Apply homography correction to match URFD camera geometry
+        if APPLY_HOMOGRAPHY:
+            frame_rgb = cv2.warpPerspective(frame_rgb, HOMOGRAPHY_MATRIX,
+                                            (IMG_WIDTH, IMG_HEIGHT))
         results = pose.process(frame_rgb)
         if results.pose_landmarks and landmarks_reliable(results.pose_landmarks.landmark):
             tl = torso_length(results.pose_landmarks.landmark)
@@ -293,8 +280,10 @@ def calibrate_reference_scale(cap, pose):
             )
             calib_areas_raw.append(bbox_area_raw)
             if DEBUG_PRINT:
-                print(f"  [calib sample {len(calib_lengths)}] torso_length={tl:.4f}  "
-                      f"bbox_h_raw={bbox_h_raw:.4f}  bbox_h_raw/torso_length={bbox_h_raw/tl:.2f}")
+                print(f"  [calib sample {len(calib_lengths)}] "
+                      f"torso_length={tl:.4f}  "
+                      f"bbox_h_raw={bbox_h_raw:.4f}  "
+                      f"bbox_h_raw/torso_length={bbox_h_raw/tl:.2f}")
         cv2.imshow("Fall Detection (press q to quit)", frame)
         cv2.waitKey(1)
         frames_scanned += 1
@@ -306,21 +295,16 @@ def calibrate_reference_scale(cap, pose):
 
     reference_scale = float(np.median(calib_lengths))
     area_calib_median = float(np.median(calib_areas_raw)) / (reference_scale ** 2)
+
     if DEBUG_PRINT:
-        print(f"  [calib] all torso_lengths: {[round(x,4) for x in calib_lengths]}")
-        print(f"  [calib] min={min(calib_lengths):.4f} max={max(calib_lengths):.4f} "
-              f"median={reference_scale:.4f}")
-        print(f"  [calib] area_calib_median (standing bbox_area, normalized) = "
-              f"{area_calib_median:.4f}")
-    print(f"Calibration complete. reference_scale = {reference_scale:.4f} "
-          f"(from {len(calib_lengths)} samples)")
+        print(f"  [calib] median torso_length = {reference_scale:.4f}")
+        print(f"  [calib] area_calib_median (normalized) = {area_calib_median:.4f}")
+
+    print(f"Calibration complete. reference_scale = {reference_scale:.4f}")
     return reference_scale, area_calib_median
 
 
 def on_fall_detected(fall_probability):
-    """Hook point: wire this into the voice check-in / alert subsystem.
-    This function intentionally does nothing else here - this script's
-    job is detection only."""
     print(f"*** FALL DETECTED (probability={fall_probability:.2f}) "
           f"at {time.strftime('%H:%M:%S')} ***")
     # TODO: trigger voice check-in module here
@@ -334,11 +318,30 @@ def main():
     feature_cols = bundle["feature_cols"]
     fall_idx = list(model.classes_).index("FALL")
 
+    # Apply deployment threshold override if set
+    if DEPLOYMENT_THRESHOLD_OVERRIDE is not None:
+        threshold = DEPLOYMENT_THRESHOLD_OVERRIDE
+        print(f"Using DEPLOYMENT_THRESHOLD_OVERRIDE = {threshold}")
+    else:
+        print(f"Using saved threshold = {threshold}")
+
+    if ADL_CALIBRATION_MODE:
+        import csv
+        calib_log = open(ADL_CALIBRATION_OUTPUT, "w", newline="")
+        calib_writer = csv.writer(calib_log)
+        calib_writer.writerow(["timestamp", "fall_probability"])
+        print(f"ADL CALIBRATION MODE: logging P(FALL) to {ADL_CALIBRATION_OUTPUT}")
+        print("Perform NORMAL ACTIVITIES ONLY (no falls) for 60+ seconds, then press q.")
+    else:
+        calib_log = None
+        calib_writer = None
+
     print(f"Loaded model. Decision threshold = {threshold}")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"ERROR: could not open camera index {CAMERA_INDEX}")
+        print(f"ERROR: could not open camera index {CAMERA_INDEX}. "
+              f"Try changing CAMERA_INDEX to 1 or 2.")
         return
 
     frame_buffer = deque(maxlen=WINDOW_SIZE)
@@ -349,19 +352,21 @@ def main():
     baseline_check_done = False
 
     with mp_pose.Pose(static_image_mode=False, model_complexity=1,
-                       min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+                       min_detection_confidence=0.5,
+                       min_tracking_confidence=0.5) as pose:
 
         reference_scale, area_calib_median = calibrate_reference_scale(cap, pose)
         if (reference_scale is None or reference_scale < 1e-4
                 or area_calib_median is None or area_calib_median < 1e-6):
-            print("Calibration failed - exiting. Re-run once positioned in frame.")
+            print("Calibration failed - exiting.")
             cap.release()
             cv2.destroyAllWindows()
             return
 
         print("Starting live detection. Press 'q' to quit.")
-        print(f"(First {BASELINE_CHECK_WINDOWS} windows are treated as a baseline "
-              f"sanity check - stand/move normally, don't simulate a fall yet.)")
+        print(f"(First {BASELINE_CHECK_WINDOWS} windows: stand normally, "
+              f"don't simulate a fall yet - baseline sanity check.)")
+
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -369,34 +374,32 @@ def main():
                 break
 
             now = time.time()
-            # cv2.VideoCapture gives BGR - convert to RGB for MediaPipe,
-            # unlike the Pi version where picamera2 already gives RGB.
+            # Webcam gives BGR — convert to RGB for MediaPipe
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Apply homography correction to match URFD camera geometry
+            if APPLY_HOMOGRAPHY:
+                frame_rgb = cv2.warpPerspective(frame_rgb, HOMOGRAPHY_MATRIX,
+                                                (IMG_WIDTH, IMG_HEIGHT))
             results = pose.process(frame_rgb)
 
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
 
                 if not landmarks_reliable(landmarks):
-                    # Key joint(s) out of frame/low-confidence - treat like
-                    # a missed detection rather than feeding the model
-                    # coordinates it never saw in training (see
-                    # landmarks_reliable() docstring for why this matters).
                     if DEBUG_PRINT:
-                        print("  [skipped frame: low-visibility landmark detected]")
+                        print("  [skipped: low-visibility landmark]")
                     prev_state = None
                     prev_time = None
                 else:
                     elapsed = (now - prev_time) if prev_time is not None else 0.0
                     feats, prev_state = extract_raw_features(
-                        landmarks, prev_state, elapsed, reference_scale, area_calib_median
+                        landmarks, prev_state, elapsed,
+                        reference_scale, area_calib_median
                     )
                     prev_time = now
                     frame_buffer.append(feats)
                     frames_since_last_window += 1
 
-                    # Run inference every STEP frames once we have a full window,
-                    # mirroring the sliding-window logic from make_windows.py
                     if len(frame_buffer) == WINDOW_SIZE and frames_since_last_window >= STEP:
                         frames_since_last_window = 0
                         X = window_to_feature_vector(list(frame_buffer), feature_cols)
@@ -405,25 +408,23 @@ def main():
                         label = "FALL" if fall_prob >= threshold else "ADL"
                         print(f"  P(FALL)={fall_prob:.2f} -> {label}")
 
+                        # Log to CSV in calibration mode
+                        if ADL_CALIBRATION_MODE and calib_writer:
+                            calib_writer.writerow([time.strftime('%H:%M:%S'), f"{fall_prob:.4f}"])
+
                         if not baseline_check_done:
                             baseline_probs.append(fall_prob)
                             if len(baseline_probs) >= BASELINE_CHECK_WINDOWS:
                                 baseline_check_done = True
                                 baseline_median = float(np.median(baseline_probs))
-                                print(f"\n[baseline check] median P(FALL) during "
-                                      f"first {BASELINE_CHECK_WINDOWS} windows = "
+                                print(f"\n[baseline check] median P(FALL) = "
                                       f"{baseline_median:.2f}")
                                 if baseline_median >= BASELINE_WARN_THRESHOLD:
                                     print(
-                                        "  WARNING: baseline P(FALL) is high during "
-                                        "normal activity. This usually means the "
-                                        "camera's angle/height/distance differs "
-                                        "enough from the training setup that the "
-                                        "model doesn't recognize this as 'normal'. "
-                                        "Check camera mounting (height, tilt, full "
-                                        "body visible) and re-run calibration. "
-                                        "Detections from here on may be unreliable "
-                                        "until this is resolved.\n"
+                                        "  WARNING: baseline P(FALL) is high. "
+                                        "Camera angle/height/distance may differ "
+                                        "from training data. Check mounting and "
+                                        "re-run calibration if needed.\n"
                                     )
                                 else:
                                     print("  Baseline looks reasonable. Continuing.\n")
@@ -431,19 +432,30 @@ def main():
                         if label == "FALL":
                             on_fall_detected(fall_prob)
             else:
-                # Pose lost (occlusion, person left frame, etc).
-                # Reset velocity baseline but DON'T clear frame_buffer -
-                # a brief gap shouldn't throw away an otherwise-valid window;
-                # only velocity needs a fresh reference point.
                 prev_state = None
                 prev_time = None
 
-            cv2.imshow("Fall Detection (press q to quit)", frame)
+            # Show warped frame if homography is active, raw frame otherwise
+            display_frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR) if APPLY_HOMOGRAPHY else frame
+            cv2.imshow("Fall Detection (press q to quit)", display_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     cap.release()
     cv2.destroyAllWindows()
+
+    if ADL_CALIBRATION_MODE and calib_log:
+        calib_log.close()
+        print(f"\nADL calibration data saved to {ADL_CALIBRATION_OUTPUT}")
+        print("Now run this to find your threshold:")
+        print(f"  python3 -c \"")
+        print(f"  import pandas as pd")
+        print(f"  df = pd.read_csv('{ADL_CALIBRATION_OUTPUT}')")
+        print(f"  print('95th percentile:', df.fall_probability.quantile(0.95))")
+        print(f"  print('99th percentile:', df.fall_probability.quantile(0.99))")
+        print(f"  print('max:', df.fall_probability.max())")
+        print(f"  \"")
+        print("Set DEPLOYMENT_THRESHOLD_OVERRIDE to (99th percentile + 0.02) in the script.")
 
 
 if __name__ == "__main__":
