@@ -58,4 +58,4 @@ pip install -r requirements.txt
 Note: `picamera2` is pre-installed on Raspberry Pi OS and is not required on the laptop.
 
 ## Author
-R.M.K.N.B. Ranasinghe — Individual Design Project
+R.M.K.N.B. Ranasinghe — Individual Mechatronics Design Project
